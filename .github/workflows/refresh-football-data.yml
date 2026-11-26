@@ -1,0 +1,168 @@
+name: Refresh football data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: football-intelligence-pages
+  cancel-in-progress: true
+
+jobs:
+  refresh-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the site
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check API token
+        env:
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+        run: |
+          if [ -z "$FOOTBALL_DATA_TOKEN" ]; then
+            echo "::error::Add the FOOTBALL_DATA_TOKEN repository secret in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Fetch fixtures and standings
+        env:
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          BASE = "https://api.football-data.org/v4"
+          COMPETITIONS = {
+              "SA": "Serie A",
+              "PL": "Premier League",
+              "PD": "La Liga",
+              "BL1": "Bundesliga",
+              "FL1": "Ligue 1",
+              "CL": "Champions League",
+          }
+
+          def request_json(path, token):
+              request = Request(
+                  f"{BASE}{path}",
+                  headers={"X-Auth-Token": token, "User-Agent": "FootballIntelligence/0.1"},
+              )
+              with urlopen(request, timeout=25) as response:
+                  return json.load(response)
+
+          token = os.environ["FOOTBALL_DATA_TOKEN"].strip()
+          now = datetime.now(timezone.utc)
+          start = (now - timedelta(days=90)).date()
+          end = (now + timedelta(days=7)).date()
+          data = {
+              "updatedAt": now.isoformat(timespec="seconds"),
+              "source": "football-data.org",
+              "dateFrom": start.isoformat(),
+              "dateTo": end.isoformat(),
+              "historyDays": 90,
+              "coverage": [],
+              "matches": [],
+              "standings": [],
+              "warnings": [],
+          }
+          last_request = 0.0
+          for code, name in COMPETITIONS.items():
+              for kind in ("matches", "standings"):
+                  elapsed = time.monotonic() - last_request
+                  if last_request and elapsed < 7.0:
+                      time.sleep(7.0 - elapsed)
+                  path = f"/competitions/{code}/{kind}"
+                  if kind == "matches":
+                      path += "?" + urlencode({"dateFrom": start.isoformat(), "dateTo": end.isoformat()})
+                  try:
+                      payload = request_json(path, token)
+                      last_request = time.monotonic()
+                      if kind == "matches":
+                          for item in payload.get("matches", []):
+                              competition = item.get("competition") or {}
+                              data["matches"].append({
+                                  "id": item.get("id"),
+                                  "competitionCode": competition.get("code", code),
+                                  "competition": competition.get("name", name),
+                                  "utcDate": item.get("utcDate"),
+                                  "status": item.get("status"),
+                                  "matchday": item.get("matchday"),
+                                  "homeTeam": {"id": (item.get("homeTeam") or {}).get("id"), "name": (item.get("homeTeam") or {}).get("name")},
+                                  "awayTeam": {"id": (item.get("awayTeam") or {}).get("id"), "name": (item.get("awayTeam") or {}).get("name")},
+                                  "score": item.get("score", {}).get("fullTime", {}),
+                              })
+                          data["coverage"].append({
+                              "code": code,
+                              "competition": name,
+                              "matches": len(payload.get("matches", [])),
+                              "finished": sum(1 for match in payload.get("matches", []) if match.get("status") == "FINISHED"),
+                          })
+                      else:
+                          for table in payload.get("standings", []):
+                              for row in table.get("table", []):
+                                  team = row.get("team") or {}
+                                  data["standings"].append({
+                                      "competitionCode": code,
+                                      "competition": name,
+                                      "type": table.get("type"),
+                                      "position": row.get("position"),
+                                      "team": team.get("name"),
+                                      "played": row.get("playedGames"),
+                                      "won": row.get("won"),
+                                      "draw": row.get("draw"),
+                                      "lost": row.get("lost"),
+                                      "points": row.get("points"),
+                                      "goalsFor": row.get("goalsFor"),
+                                      "goalsAgainst": row.get("goalsAgainst"),
+                                  })
+                  except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+                      last_request = time.monotonic()
+                      code_text = getattr(exc, "code", "network")
+                      data["warnings"].append(f"{name} / {kind}: fonte non disponibile ({code_text}).")
+                      time.sleep(8)
+
+          if not data["coverage"]:
+              raise SystemExit("The provider returned no competition data; the existing snapshot was kept.")
+
+          output = Path("data")
+          output.mkdir(parents=True, exist_ok=True)
+          serialized = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+          (output / "latest.json").write_text(serialized, encoding="utf-8")
+          feed = "window.FOOTBALL_DATA = " + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + ";\n"
+          (output / "feed.js").write_text(feed, encoding="utf-8")
+          print(f"Saved {len(data['matches'])} matches and {len(data['standings'])} standings rows")
+          PY
+
+      - name: Prepare the site files
+        run: |
+          mkdir -p _site
+          rsync -a --exclude='.git' --exclude='.github' --exclude='scripts' --exclude='_site' ./ _site/
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

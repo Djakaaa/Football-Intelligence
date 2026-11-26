@@ -1,0 +1,5 @@
+Football Intelligence AI
+
+Anteprima locale: apri index.html. Per installarla sul telefono serve pubblicare la cartella outputs su GitHub Pages, che fornisce l'indirizzo HTTPS. Non serve avviare un server sul PC.
+
+Segui il report outputs/GITHUB_REPORT.md oppure il README nella radice del repository.
